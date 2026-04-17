@@ -11,12 +11,20 @@ switches = {}
 port_history = defaultdict(lambda: deque(maxlen=5))
 current_util = defaultdict(float)
 
+# Managed flow path for h1 <-> h2
 current_path = "A"
+
 MODE = "predictive"
 THRESHOLD_MBPS = 3.0
+SWITCH_MARGIN = 0.5
+MIN_HOLD_TIME = 3.0
+last_switch_time = 0
 
 H1 = EthAddr("00:00:00:00:00:01")
 H2 = EthAddr("00:00:00:00:00:02")
+H3 = EthAddr("00:00:00:00:00:03")
+H4 = EthAddr("00:00:00:00:00:04")
+
 ARP_TYPE = 0x0806
 
 
@@ -52,7 +60,7 @@ def predict_util(dpid, port):
     key = (dpid, port)
     hist = port_history[key]
 
-    if len(hist) < 3:
+    if len(hist) < 4:
         return current_util.get(key, 0.0)
 
     samples = []
@@ -62,12 +70,17 @@ def predict_util(dpid, port):
         dt = t2 - t1
         if dt > 0:
             delta_bytes = (tx2 - tx1) + (rx2 - rx1)
-            samples.append((delta_bytes * 8.0) / dt / 1_000_000.0)
+            mbps = (delta_bytes * 8.0) / dt / 1_000_000.0
+            samples.append(mbps)
 
     if len(samples) < 2:
         return samples[-1] if samples else 0.0
 
-    return max(0.0, samples[-1] + (samples[-1] - samples[-2]))
+    trend = samples[-1] - samples[-2]
+    prediction = samples[-1] + trend
+
+    # Clamp prediction to avoid wild overshoot
+    return max(0.0, min(prediction, samples[-1] * 1.5))
 
 
 def install_flow(conn, match, out_port, priority=100):
@@ -78,11 +91,51 @@ def install_flow(conn, match, out_port, priority=100):
     conn.send(msg)
 
 
+def install_arp_flood(conn):
+    msg = of.ofp_flow_mod()
+    msg.priority = 10
+    msg.match = of.ofp_match(dl_type=ARP_TYPE)
+    msg.actions.append(of.ofp_action_output(port=of.OFPP_FLOOD))
+    conn.send(msg)
+
+
 def clear_flows():
     for c in switches.values():
         msg = of.ofp_flow_mod(command=of.OFPFC_DELETE)
         msg.match = of.ofp_match()
         c.send(msg)
+
+
+def install_background_flow_path_a(s1, s2):
+    # h3 -> h4 via Path A (s1 -> s2)
+    install_flow(s1, of.ofp_match(dl_src=H3, dl_dst=H4), 3)
+    install_flow(s2, of.ofp_match(dl_src=H3, dl_dst=H4), 2)
+
+    # h4 -> h3 via Path A
+    install_flow(s2, of.ofp_match(dl_src=H4, dl_dst=H3), 3)
+    install_flow(s1, of.ofp_match(dl_src=H4, dl_dst=H3), 2)
+
+
+def install_managed_flow_path_a(s1, s2):
+    # h1 -> h2 via Path A (s1 -> s2)
+    install_flow(s1, of.ofp_match(dl_src=H1, dl_dst=H2), 3)
+    install_flow(s2, of.ofp_match(dl_src=H1, dl_dst=H2), 1)
+
+    # h2 -> h1 via Path A
+    install_flow(s2, of.ofp_match(dl_src=H2, dl_dst=H1), 3)
+    install_flow(s1, of.ofp_match(dl_src=H2, dl_dst=H1), 1)
+
+
+def install_managed_flow_path_b(s1, s2, s3):
+    # h1 -> h2 via Path B (s1 -> s3 -> s2)
+    install_flow(s1, of.ofp_match(dl_src=H1, dl_dst=H2), 4)
+    install_flow(s3, of.ofp_match(dl_src=H1, dl_dst=H2), 2)
+    install_flow(s2, of.ofp_match(dl_src=H1, dl_dst=H2), 1)
+
+    # h2 -> h1 via Path B
+    install_flow(s2, of.ofp_match(dl_src=H2, dl_dst=H1), 4)
+    install_flow(s3, of.ofp_match(dl_src=H2, dl_dst=H1), 1)
+    install_flow(s1, of.ofp_match(dl_src=H2, dl_dst=H1), 1)
 
 
 def install_paths():
@@ -92,79 +145,57 @@ def install_paths():
     s2 = switches.get(2)
     s3 = switches.get(3)
 
-    if not s1 or not s2:
+    if not s1 or not s2 or not s3:
         return
 
+    install_arp_flood(s1)
+    install_arp_flood(s2)
+    install_arp_flood(s3)
+
+    # Background traffic always stays on Path A
+    install_background_flow_path_a(s1, s2)
+
+    # Managed traffic is rerouted by the controller
     if current_path == "A":
-        # ---------- ICMP/unicast h1 -> h2 ----------
-        install_flow(s1, of.ofp_match(dl_src=H1, dl_dst=H2), 3)
-        install_flow(s2, of.ofp_match(dl_src=H1, dl_dst=H2), 1)
-
-        # ---------- ICMP/unicast h2 -> h1 ----------
-        install_flow(s2, of.ofp_match(dl_src=H2, dl_dst=H1), 3)
-        install_flow(s1, of.ofp_match(dl_src=H2, dl_dst=H1), 1)
-
-        # ---------- ARP request h1 -> h2 ----------
-        # h1 sends ARP broadcast into s1 port 1
-        install_flow(s1, of.ofp_match(dl_type=ARP_TYPE, in_port=1), 3)
-        # same ARP broadcast arrives at s2 from s1 on port 3, forward to h2 on port 1
-        install_flow(s2, of.ofp_match(dl_type=ARP_TYPE, in_port=3), 1)
-
-        # ---------- ARP reply h2 -> h1 ----------
-        install_flow(s2, of.ofp_match(dl_type=ARP_TYPE, dl_src=H2, dl_dst=H1), 3)
-        install_flow(s1, of.ofp_match(dl_type=ARP_TYPE, dl_src=H2, dl_dst=H1), 1)
-
-        log.info("Installed Path A: s1 -> s2")
-
+        install_managed_flow_path_a(s1, s2)
+        log.info("Installed paths: h3-h4 fixed on A, h1-h2 on A")
     else:
-        if not s3:
-            return
-
-        # ---------- ICMP/unicast h1 -> h2 ----------
-        install_flow(s1, of.ofp_match(dl_src=H1, dl_dst=H2), 4)
-        install_flow(s3, of.ofp_match(dl_src=H1, dl_dst=H2), 2)
-        install_flow(s2, of.ofp_match(dl_src=H1, dl_dst=H2), 1)
-
-        # ---------- ICMP/unicast h2 -> h1 ----------
-        install_flow(s2, of.ofp_match(dl_src=H2, dl_dst=H1), 4)
-        install_flow(s3, of.ofp_match(dl_src=H2, dl_dst=H1), 1)
-        install_flow(s1, of.ofp_match(dl_src=H2, dl_dst=H1), 1)
-
-        # ---------- ARP request h1 -> h2 ----------
-        install_flow(s1, of.ofp_match(dl_type=ARP_TYPE, in_port=1), 4)
-        install_flow(s3, of.ofp_match(dl_type=ARP_TYPE, in_port=1), 2)
-        install_flow(s2, of.ofp_match(dl_type=ARP_TYPE, in_port=4), 1)
-
-        # ---------- ARP reply h2 -> h1 ----------
-        install_flow(s2, of.ofp_match(dl_type=ARP_TYPE, dl_src=H2, dl_dst=H1), 4)
-        install_flow(s3, of.ofp_match(dl_type=ARP_TYPE, dl_src=H2, dl_dst=H1), 1)
-        install_flow(s1, of.ofp_match(dl_type=ARP_TYPE, dl_src=H2, dl_dst=H1), 1)
-
-        log.info("Installed Path B: s1 -> s3 -> s2")
+        install_managed_flow_path_b(s1, s2, s3)
+        log.info("Installed paths: h3-h4 fixed on A, h1-h2 on B")
 
 
 def choose_path():
-    global current_path
+    global current_path, last_switch_time
 
-    # s1 port 3 = direct link to s2
+    # Monitor direct bottleneck link s1 -> s2
     monitored = (1, 3)
 
     curr = current_util.get(monitored, 0.0)
     pred = predict_util(*monitored)
+    now = time.time()
 
     if MODE == "static":
         new_path = "A"
-    elif MODE == "reactive":
-        new_path = "B" if curr > THRESHOLD_MBPS else "A"
-    else:
-        new_path = "B" if pred > THRESHOLD_MBPS else "A"
 
-    if new_path != current_path:
+    elif MODE == "reactive":
+        if current_path == "A":
+            new_path = "B" if curr > THRESHOLD_MBPS + SWITCH_MARGIN else "A"
+        else:
+            new_path = "A" if curr < THRESHOLD_MBPS - SWITCH_MARGIN else "B"
+
+    else:  # predictive
+        if current_path == "A":
+            new_path = "B" if pred > THRESHOLD_MBPS + SWITCH_MARGIN else "A"
+        else:
+            new_path = "A" if pred < THRESHOLD_MBPS - SWITCH_MARGIN else "B"
+
+    if new_path != current_path and (now - last_switch_time) > MIN_HOLD_TIME:
         log.info(
-            "Switching path from %s to %s (curr=%.3f Mbps, pred=%.3f Mbps)",
+            "Switching managed flow from %s to %s (curr=%.3f Mbps, pred=%.3f Mbps)",
             current_path, new_path, curr, pred
         )
         current_path = new_path
+        last_switch_time = now
         install_paths()
 
 
@@ -198,4 +229,7 @@ def launch(mode="predictive", threshold="3.0"):
 
     Timer(1, request_port_stats, recurring=True)
 
-    log.info("Started controller: mode=%s threshold=%.2f Mbps", MODE, THRESHOLD_MBPS)
+    log.info(
+        "Started controller: mode=%s threshold=%.2f Mbps margin=%.2f hold=%.1fs",
+        MODE, THRESHOLD_MBPS, SWITCH_MARGIN, MIN_HOLD_TIME
+    )
